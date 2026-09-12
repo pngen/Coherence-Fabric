@@ -1,0 +1,11 @@
+# Normalise text files to LF in the repository and in the working tree so that
+# the same sources build identically on every platform.
+* text=auto eol=lf
+
+# Binary artefacts must never be normalised.
+*.png binary
+*.jpg binary
+*.ico binary
+*.lib binary
+*.dll binary
+*.exe binary

@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(NOT WIN32)
+  find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/CoherenceFabricTargets.cmake")
+
+check_required_components(CoherenceFabric)
+
+set(CoherenceFabric_VERSION "@PROJECT_VERSION@")
+set(CoherenceFabric_HAS_CUDA "@COHERENCE_FABRIC_CUDA_ENABLED@")

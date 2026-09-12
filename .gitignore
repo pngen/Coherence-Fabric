@@ -1,0 +1,38 @@
+# Build trees
+/build/
+/out/
+/install/
+/_build*/
+/cmake-build-*/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# Scratch, logs, crash artifacts
+*.log
+*.dmp
+*.pdb.tmp
+/scratch/
+/tmp/
+
+# Local runtime state produced by tests, examples, CLI and benchmarks
+*.cfstate
+*.cfstate.tmp
+*.cftmp
+/cf-state/
+
+# Toolchain output
+*.obj
+*.o
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.pdb
