@@ -162,6 +162,18 @@ if(COHERENCE_FABRIC_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    # Compile for the architectures actually present on the build host, which is
+    # what makes the CUDA proof a real device proof rather than a simulated one.
+    # This has to be decided before the language is enabled: enabling it defines
+    # CMAKE_CUDA_ARCHITECTURES with the compiler's own default, after which a
+    # "not defined" test never holds and the oldest architecture is built.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+      else()
+        set(CMAKE_CUDA_ARCHITECTURES 52 CACHE STRING "CUDA architectures to build for")
+      endif()
+    endif()
     enable_language(CUDA)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
@@ -187,15 +199,6 @@ if(COHERENCE_FABRIC_CUDA_ENABLED)
       $<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive-;/Zc:__cplusplus;/utf-8>)
     if(COHERENCE_FABRIC_WARNINGS_AS_ERRORS)
       target_compile_options(coherence_fabric_cuda PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/WX>)
-    endif()
-  endif()
-  # Compile for the architectures actually present on the build host, which is
-  # what makes the CUDA proof a real device proof rather than a simulated one.
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
-    else()
-      set(CMAKE_CUDA_ARCHITECTURES 52 CACHE STRING "CUDA architectures to build for")
     endif()
   endif()
   target_compile_definitions(coherence_fabric_cuda PUBLIC COHERENCE_FABRIC_HAS_CUDA=1)

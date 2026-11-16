@@ -262,8 +262,17 @@ Result<PublicationReceipt> CoherenceEngine::publish(const PublishRequest& reques
     Status applied = apply_journal_entry(impl_->durable, pending_entry, impl_->store->limits());
     if (!applied.ok()) impl_->store_healthy = false;
   }
+  // The replica the version is published from must still be in service. Committing
+  // after it was retired or fenced would bring an inert replica back as current
+  // and make a version authoritative that no live replica holds.
+  const auto publishing_region = impl_->regions.find(request.region);
+  const bool publishing_region_gone =
+      publishing_region == impl_->regions.end() ||
+      publishing_region->second.lifecycle == RegionLifecycle::Retired ||
+      publishing_region->second.state == CoherenceState::Retired ||
+      publishing_region->second.state == CoherenceState::Fenced;
   if (object.pending_publication != pending.id || object.ownership_generation != ownership ||
-      object.authoritative_version != base) {
+      object.authoritative_version != base || publishing_region_gone) {
     object.publication_state = PublicationState::Aborted;
     object.pending_publication = PublicationId::nil();
     object.pending_version = VersionId::nil();

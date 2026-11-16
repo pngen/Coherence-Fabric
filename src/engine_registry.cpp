@@ -446,6 +446,23 @@ Status CoherenceEngine::retire_region(RegionId id, RegionGeneration generation,
   region.updated_sequence = impl_->sequence;
   impl_->release_region_name_locked(region);
 
+  // The invalidation record is settled as well. Left requested, it would keep a
+  // write transfer pending for an acknowledgement a retired replica never gives.
+  for (auto& [invalidation_id, invalidation] : impl_->invalidations) {
+    (void)invalidation_id;
+    if (invalidation.region != region.id || invalidation.state != InvalidationState::Requested) {
+      continue;
+    }
+    invalidation.state = InvalidationState::Superseded;
+    invalidation.settled_sequence = impl_->sequence;
+    invalidation.rationale =
+        "the targeted replica was retired; the invalidation is satisfied vacuously";
+    JournalEntry invalidation_entry;
+    invalidation_entry.kind = JournalEntryKind::UpsertInvalidation;
+    invalidation_entry.invalidation = invalidation;
+    (void)impl_->append_locked(invalidation_entry);
+  }
+
   const auto object_it = impl_->objects.find(region.object);
   if (object_it != impl_->objects.end()) {
     ObjectRecord& object = object_it->second;

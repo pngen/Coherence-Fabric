@@ -3,8 +3,11 @@
 // Semantic contract coverage for the coherence engine: authority, versions,
 // publication, invalidation, synchronization, dirty state and fail-closed
 // behaviour.
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "coherence/bytes.hpp"
@@ -27,9 +30,11 @@ struct Fixture {
   coherence::CoherenceDomainId domain;
   coherence::ObjectId object;
 
-  explicit Fixture(coherence::CoherencePolicy policy = coherence::strict_policy("test")) {
-    config.enable_durability = false;
+  explicit Fixture(coherence::CoherencePolicy policy = coherence::strict_policy("test"),
+                   std::shared_ptr<coherence::DurableStore> store = nullptr) {
+    config.enable_durability = store != nullptr;
     engine = std::make_unique<coherence::CoherenceEngine>(config);
+    if (store != nullptr) (void)engine->attach_store(std::move(store));
     auto created_domain = engine->create_domain("test");
     domain = created_domain.value().id;
     auto created_object = engine->register_object(domain, "object", 4096, policy);
@@ -1236,6 +1241,286 @@ CF_TEST(recovery_from_a_durable_store_does_not_restore_currentness) {
   CF_EXPECT(decision.value().reason == coherence::StatusCode::StaleEpoch);
   CF_EXPECT(decision.value().outcome == coherence::ReadOutcome::ReadBlocked);
   CF_EXPECT_AUDIT_CLEAN(reader.audit());
+}
+
+// ---------------------------------------------------------------------------
+// Revalidation gates, retirement and re-admission, publication commit
+// ---------------------------------------------------------------------------
+namespace {
+
+/// Revalidate a fresh replica, take write authority and publish version 1 from it.
+coherence::WriteGrant establish_first_version(Fixture& fixture,
+                                              const coherence::ParticipantRecord& writer,
+                                              const coherence::RegionRecord& region,
+                                              const std::string& content) {
+  coherence::RevalidateRequest revalidate;
+  revalidate.context = fixture.context(writer);
+  revalidate.region = region.id;
+  revalidate.region_generation = region.generation;
+  revalidate.observed_version = coherence::VersionId::from_value(1);
+  revalidate.content = fingerprint_of(content);
+  (void)fixture.engine->revalidate_region(revalidate);
+  coherence::WriteRequest write;
+  write.context = fixture.context(writer);
+  write.region = region.id;
+  write.region_generation = region.generation;
+  const coherence::WriteGrant grant = fixture.engine->acquire_write(write).value();
+  coherence::PublishRequest publish;
+  publish.context = fixture.context(writer);
+  publish.ownership_generation = grant.context.ownership_generation;
+  publish.region = region.id;
+  publish.region_generation = region.generation;
+  publish.expected_base_version = coherence::VersionId::nil();
+  publish.allow_without_dirty = true;
+  publish.content = fingerprint_of(content);
+  (void)fixture.engine->publish(publish);
+  return grant;
+}
+
+void release_write(Fixture& fixture, const coherence::ParticipantRecord& writer,
+                   const coherence::WriteGrant& grant) {
+  coherence::ReleaseRequest handback;
+  handback.context = fixture.context(writer);
+  handback.ownership_generation = grant.context.ownership_generation;
+  handback.release_write_authority = true;
+  (void)fixture.engine->release(handback);
+}
+
+/// A durable store that runs a hook once, immediately before the pending
+/// publication record is appended. That append is the one durable write the
+/// engine performs with its state lock released.
+class HookStore final : public coherence::DurableStore {
+ public:
+  coherence::Result<coherence::LoadReport> open(coherence::DurableImage& image) override {
+    return inner_.open(image);
+  }
+  coherence::Status append(const coherence::JournalEntry& entry) override {
+    if (entry.kind == coherence::JournalEntryKind::SetPendingPublication && before_pending) {
+      std::function<void()> hook = std::move(before_pending);
+      before_pending = nullptr;
+      hook();
+    }
+    return inner_.append(entry);
+  }
+  coherence::Status compact(const coherence::DurableImage& image) override {
+    return inner_.compact(image);
+  }
+  coherence::Status close() override { return inner_.close(); }
+  [[nodiscard]] std::uint64_t journal_bytes() const override { return inner_.journal_bytes(); }
+  [[nodiscard]] std::string describe() const override { return "hook store"; }
+  [[nodiscard]] const coherence::StoreLimits& limits() const noexcept override {
+    return inner_.limits();
+  }
+
+  std::function<void()> before_pending;
+
+ private:
+  coherence::MemoryDurableStore inner_;
+};
+
+} // namespace
+
+CF_TEST(a_dirty_replica_becomes_current_only_through_a_publication) {
+  context.phase("SETUP");
+  Fixture fixture;
+  const coherence::RegionRecord region = fixture.region(fixture.alpha, "replica", 0, 4096);
+  const coherence::WriteGrant grant =
+      establish_first_version(fixture, fixture.alpha, region, "one");
+  CF_REQUIRE(fixture.engine->get_object(fixture.object).value().authoritative_version ==
+             coherence::VersionId::from_value(1));
+
+  coherence::DirtyRequest dirty;
+  dirty.context = fixture.context(fixture.alpha);
+  dirty.region = region.id;
+  dirty.region_generation = region.generation;
+  dirty.ownership_generation = grant.context.ownership_generation;
+  dirty.base_version = coherence::VersionId::from_value(1);
+  dirty.content = fingerprint_of("two");
+  CF_REQUIRE(fixture.engine->mark_dirty(dirty).has_value());
+
+  context.phase("ATTACK");
+  // The holder claims that its modified replica is the published version.
+  coherence::RevalidateRequest claim;
+  claim.context = fixture.context(fixture.alpha);
+  claim.region = region.id;
+  claim.region_generation = region.generation;
+  claim.observed_version = coherence::VersionId::from_value(1);
+  claim.content = fingerprint_of("two");
+  CF_EXPECT(fixture.engine->revalidate_region(claim).code() ==
+            coherence::StatusCode::DirtyUnpublished);
+
+  context.phase("VERIFY");
+  const coherence::RegionRecord after = fixture.engine->get_region(region.id).value();
+  CF_EXPECT(after.state == coherence::CoherenceState::Dirty);
+  CF_EXPECT(after.dirty == coherence::DirtyCondition::DirtyUnpublished);
+  CF_EXPECT(!after.dirty_published);
+  CF_EXPECT(fixture.engine->get_object(fixture.object).value().has_unpublished_dirty);
+}
+
+CF_TEST(revalidation_cannot_contradict_a_current_replica_of_the_same_extent) {
+  context.phase("SETUP");
+  Fixture fixture;
+  const coherence::RegionRecord alpha_region = fixture.region(fixture.alpha, "alpha", 0, 4096);
+  const coherence::RegionRecord beta_region = fixture.region(fixture.beta, "beta", 0, 4096);
+  const coherence::RegionRecord beta_part = fixture.region(fixture.beta, "beta-part", 0, 2048);
+  const coherence::WriteGrant grant =
+      establish_first_version(fixture, fixture.alpha, alpha_region, "one");
+  release_write(fixture, fixture.alpha, grant);
+
+  context.phase("ATTACK");
+  // Beta claims the published version for the same extent with other bytes.
+  coherence::RevalidateRequest claim;
+  claim.context = fixture.context(fixture.beta);
+  claim.region = beta_region.id;
+  claim.region_generation = beta_region.generation;
+  claim.observed_version = coherence::VersionId::from_value(1);
+  claim.content = fingerprint_of("something else");
+  CF_EXPECT(fixture.engine->revalidate_region(claim).code() ==
+            coherence::StatusCode::ContentMismatch);
+  CF_EXPECT(fixture.engine->get_region(beta_region.id).value().state !=
+            coherence::CoherenceState::Current);
+
+  context.phase("VERIFY");
+  // The published bytes are accepted.
+  claim.context = fixture.context(fixture.beta);
+  claim.content = fingerprint_of("one");
+  const auto accepted = fixture.engine->revalidate_region(claim);
+  CF_REQUIRE(accepted.has_value());
+  CF_EXPECT(accepted.value().state == coherence::CoherenceState::Current);
+
+  // A replica of another extent holds other bytes by construction.
+  coherence::RevalidateRequest part;
+  part.context = fixture.context(fixture.beta);
+  part.region = beta_part.id;
+  part.region_generation = beta_part.generation;
+  part.observed_version = coherence::VersionId::from_value(1);
+  part.content = fingerprint_of("first half");
+  const auto partial = fixture.engine->revalidate_region(part);
+  CF_REQUIRE(partial.has_value());
+  CF_EXPECT(partial.value().state == coherence::CoherenceState::Current);
+}
+
+CF_TEST(retiring_a_replica_settles_the_invalidation_that_targets_it) {
+  context.phase("SETUP");
+  Fixture fixture;
+  const coherence::RegionRecord alpha_region = fixture.region(fixture.alpha, "alpha", 0, 4096);
+  const coherence::WriteGrant first =
+      establish_first_version(fixture, fixture.alpha, alpha_region, "one");
+  release_write(fixture, fixture.alpha, first);
+
+  // Beta takes write authority; alpha's current replica must be invalidated.
+  coherence::WriteRequest write;
+  write.context = fixture.context(fixture.beta);
+  const auto pending = fixture.engine->acquire_write(write);
+  CF_REQUIRE(pending.has_value());
+  CF_EXPECT(pending.value().granted);
+  CF_EXPECT(!pending.value().may_mutate_now);
+  CF_REQUIRE(pending.value().required_invalidations.size() == 1u);
+  const coherence::InvalidationId invalidation = pending.value().required_invalidations.front().id;
+
+  context.phase("ATTACK");
+  // The targeted replica is retired instead of acknowledging.
+  CF_REQUIRE(fixture.engine
+                 ->retire_region(alpha_region.id, alpha_region.generation, fixture.engine->epoch())
+                 .ok());
+
+  context.phase("VERIFY");
+  // The transfer is not left waiting for an acknowledgement nobody can give.
+  write.context = fixture.context(fixture.beta);
+  const auto effective = fixture.engine->acquire_write(write);
+  CF_REQUIRE(effective.has_value());
+  CF_EXPECT(effective.value().granted);
+  CF_EXPECT(effective.value().may_mutate_now);
+  CF_EXPECT(fixture.engine->get_object(fixture.object).value().authority ==
+            coherence::AuthorityMode::ExclusiveWriter);
+  bool settled = false;
+  const coherence::CoherenceSnapshot snapshot = fixture.engine->snapshot().value();
+  for (const coherence::InvalidationRecord& record : snapshot.invalidations) {
+    if (record.id == invalidation) {
+      settled = record.state == coherence::InvalidationState::Superseded;
+    }
+  }
+  CF_EXPECT(settled);
+  CF_EXPECT(fixture.engine->get_region(alpha_region.id).value().state ==
+            coherence::CoherenceState::Retired);
+}
+
+CF_TEST(readmission_under_a_new_boot_revokes_the_previous_incarnation) {
+  context.phase("SETUP");
+  Fixture fixture;
+  const coherence::RegionRecord alpha_region = fixture.region(fixture.alpha, "alpha", 0, 4096);
+  (void)establish_first_version(fixture, fixture.alpha, alpha_region, "one");
+  CF_REQUIRE(fixture.engine->get_object(fixture.object).value().authority ==
+             coherence::AuthorityMode::ExclusiveWriter);
+
+  context.phase("ATTACK");
+  // The process that holds write authority is replaced by a new incarnation.
+  const auto readmitted = fixture.engine->register_participant(
+      "alpha", coherence::generate_participant_boot_id(), fixture.engine->epoch(), "node-a");
+  CF_REQUIRE(readmitted.has_value());
+  CF_EXPECT(readmitted.value().boot != fixture.alpha.boot);
+
+  context.phase("VERIFY");
+  const coherence::ObjectRecord object = fixture.engine->get_object(fixture.object).value();
+  CF_EXPECT(object.authority != coherence::AuthorityMode::ExclusiveWriter);
+  CF_EXPECT(object.writer.is_nil());
+  CF_EXPECT(fixture.engine->get_region(alpha_region.id).value().state ==
+            coherence::CoherenceState::Retired);
+  // The object is not write-locked by a process that no longer exists.
+  coherence::WriteRequest write;
+  write.context = fixture.context(fixture.beta);
+  const auto grant = fixture.engine->acquire_write(write);
+  CF_REQUIRE(grant.has_value());
+  CF_EXPECT(grant.value().granted);
+  CF_EXPECT(grant.value().reason != coherence::StatusCode::ExclusiveWriterConflict);
+}
+
+CF_TEST(a_publication_never_brings_a_retired_replica_back) {
+  context.phase("SETUP");
+  auto store = std::make_shared<HookStore>();
+  Fixture fixture(coherence::strict_policy("test"), store);
+  const coherence::RegionRecord region = fixture.region(fixture.alpha, "replica", 0, 4096);
+  const coherence::WriteGrant grant =
+      establish_first_version(fixture, fixture.alpha, region, "one");
+  CF_REQUIRE(fixture.engine->get_object(fixture.object).value().authoritative_version ==
+             coherence::VersionId::from_value(1));
+  coherence::DirtyRequest dirty;
+  dirty.context = fixture.context(fixture.alpha);
+  dirty.region = region.id;
+  dirty.region_generation = region.generation;
+  dirty.ownership_generation = grant.context.ownership_generation;
+  dirty.base_version = coherence::VersionId::from_value(1);
+  dirty.content = fingerprint_of("two");
+  CF_REQUIRE(fixture.engine->mark_dirty(dirty).has_value());
+
+  context.phase("ATTACK");
+  // The replica is retired while the publication's durable record is being
+  // written. The retirement runs on its own thread because the engine serialises
+  // store access; the pause only gives it the head start, and either order of
+  // the two operations must leave the replica retired.
+  coherence::CoherenceEngine* const engine = fixture.engine.get();
+  std::thread retirement;
+  store->before_pending = [&retirement, engine, region]() {
+    retirement = std::thread([engine, region]() {
+      (void)engine->retire_region(region.id, region.generation, engine->epoch());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  };
+  coherence::PublishRequest publish;
+  publish.context = fixture.context(fixture.alpha);
+  publish.ownership_generation = grant.context.ownership_generation;
+  publish.region = region.id;
+  publish.region_generation = region.generation;
+  publish.expected_base_version = coherence::VersionId::from_value(1);
+  publish.content = fingerprint_of("two");
+  const auto published = fixture.engine->publish(publish);
+  if (retirement.joinable()) retirement.join();
+
+  context.phase("VERIFY");
+  CF_EXPECT(published.has_value());
+  const coherence::RegionRecord after = fixture.engine->get_region(region.id).value();
+  CF_EXPECT(after.lifecycle == coherence::RegionLifecycle::Retired);
+  CF_EXPECT(after.state == coherence::CoherenceState::Retired);
 }
 
 CF_TEST_MAIN()

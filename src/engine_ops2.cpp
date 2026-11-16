@@ -523,12 +523,55 @@ Result<RegionRecord> CoherenceEngine::revalidate_region(const RevalidateRequest&
     return Result<RegionRecord>::failure(Status(
         StatusCode::InvalidArgument, "revalidation must name the version actually observed"));
   }
+  // A replica holding an unpublished modification of the authority holder becomes
+  // current only through a publication. An observation cannot stand in for one,
+  // and it cannot turn the modification into a published one.
+  if (region->state == CoherenceState::Dirty || region->dirty == DirtyCondition::DirtyUnpublished) {
+    return Result<RegionRecord>::failure(Status(
+        StatusCode::DirtyUnpublished,
+        "a replica holding an unpublished modification cannot be revalidated; publish the "
+        "modification or release write authority first"));
+  }
 
-  impl_->tick();
   const VersionId authoritative = resolved.object->authoritative_version;
   const bool matches_authoritative = authoritative.defined() &&
                                      request.observed_version == authoritative;
   const bool establishes_initial = !authoritative.defined();
+  const CoherenceState target = (matches_authoritative || establishes_initial)
+                                    ? CoherenceState::Current
+                                    : CoherenceState::Stale;
+  if (!is_legal_coherence_transition(region->state, target)) {
+    return Result<RegionRecord>::failure(Status(
+        StatusCode::InvalidTransition, "revalidation cannot make this replica " +
+                                           std::string(to_token(target)),
+        std::string(to_token(region->state))));
+  }
+  // Two current replicas of the same extent and version hold the same bytes.
+  // Where the policy works with content fingerprints, an observation that
+  // contradicts a replica already certified at the authoritative version does
+  // not certify this one. Replicas of other extents say nothing about it.
+  if (matches_authoritative && policy->require_content_fingerprint && request.content.defined) {
+    for (const RegionId peer_id : resolved.object->replicas) {
+      if (peer_id == region->id) continue;
+      const auto peer = impl_->regions.find(peer_id);
+      if (peer == impl_->regions.end()) continue;
+      if (peer->second.state != CoherenceState::Current || peer->second.version != authoritative ||
+          !peer->second.content.defined || peer->second.offset != region->offset ||
+          peer->second.length != region->length) {
+        continue;
+      }
+      if (!(peer->second.content == request.content)) {
+        return Result<RegionRecord>::failure(Status(
+            StatusCode::ContentMismatch,
+            "the observed fingerprint does not match the content of the authoritative version",
+            "expected " + peer->second.content.to_string() + " observed " +
+                request.content.to_string()));
+      }
+      break;
+    }
+  }
+
+  impl_->tick();
 
   const EvidenceRecord evidence = impl_->make_evidence(
       request.byte_compared ? EvidenceKind::ByteComparison : EvidenceKind::RuntimeObservation,
@@ -542,10 +585,6 @@ Result<RegionRecord> CoherenceEngine::revalidate_region(const RevalidateRequest&
   region->evidence_generation = evidence.generation;
   region->updated_sequence = impl_->sequence;
   if (request.content.defined) region->content = request.content;
-  if (region->dirty == DirtyCondition::DirtyUnpublished) {
-    region->dirty = DirtyCondition::DirtyPublished;
-    region->dirty_published = true;
-  }
   if (matches_authoritative || establishes_initial) {
     region->state = CoherenceState::Current;
     region->last_synced_version = request.observed_version;

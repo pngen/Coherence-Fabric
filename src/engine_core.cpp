@@ -393,6 +393,135 @@ Result<DomainRecord> CoherenceEngine::get_domain(CoherenceDomainId id) const {
 // ---------------------------------------------------------------------------
 // Participants
 // ---------------------------------------------------------------------------
+namespace {
+
+/// Everything a fence does to the authority of one participant incarnation:
+/// write authority, replicas, in-flight transfers, outstanding invalidations and
+/// read grants. Shared by an explicit fence and by re-admission under a new boot
+/// identity, which fences the superseded incarnation.
+void fence_incarnation_locked(CoherenceEngine::Impl& state, ParticipantId id,
+                              ParticipantBootId boot, const std::string& reason,
+                              std::vector<JournalEntry>& entries) {
+  // 1. Revoke write authority held by this incarnation.
+  for (auto& [object_id, object] : state.objects) {
+    (void)object_id;
+    bool changed = false;
+    if (object.writer == id && object.writer_boot == boot) {
+      object.authority = AuthorityMode::None;
+      object.writer = ParticipantId::nil();
+      object.writer_boot = ParticipantBootId::nil();
+      if (object.publication_state == PublicationState::PendingDurable ||
+          object.publication_state == PublicationState::RecoveryRequired) {
+        object.publication_state = PublicationState::Aborted;
+        object.pending_publication = PublicationId::nil();
+        object.pending_version = VersionId::nil();
+        object.pending_content = ContentFingerprint{};
+        JournalEntry clear;
+        clear.kind = JournalEntryKind::ClearPendingPublication;
+        clear.remove_object = object.id;
+        entries.push_back(clear);
+      }
+      // The only dirty authority holder disappeared before publication. The
+      // runtime never invents a successful publication from this.
+      if (object.has_unpublished_dirty) {
+        object.has_unpublished_dirty = false;
+        switch (state.policies.count(object.policy) != 0
+                    ? state.policies.at(object.policy).dirty_loss_policy
+                    : DirtyLossPolicy::ReportUnknown) {
+          case DirtyLossPolicy::ReportLost:
+            object.dirty_condition = DirtyCondition::DirtyLost;
+            break;
+          case DirtyLossPolicy::RequireRecovery:
+            object.dirty_condition = DirtyCondition::DirtyUnknown;
+            object.lifecycle = ObjectLifecycle::RecoveryRequired;
+            object.recovery_note =
+                "dirty authority holder was fenced before publication; recoverable state is "
+                "unknown";
+            break;
+          case DirtyLossPolicy::ReportUnknown:
+          case DirtyLossPolicy::Unspecified:
+          default:
+            object.dirty_condition = DirtyCondition::DirtyUnknown;
+            break;
+        }
+      }
+      object.updated_sequence = state.sequence;
+      changed = true;
+    }
+    if (changed) {
+      ObjectRecord durable_copy = object;
+      scrub_object_for_persistence(durable_copy);
+      JournalEntry entry;
+      entry.kind = JournalEntryKind::UpsertObject;
+      entry.object = std::move(durable_copy);
+      entries.push_back(std::move(entry));
+    }
+  }
+
+  // 2. Fence the participant's regions. Fenced contents are never a source of
+  //    truth again for that incarnation.
+  for (auto& [region_id, region] : state.regions) {
+    (void)region_id;
+    if (region.participant != id || region.boot != boot) continue;
+    if (region.state == CoherenceState::Retired) continue;
+    region.state = CoherenceState::Fenced;
+    if (region.dirty == DirtyCondition::DirtyUnpublished) {
+      region.dirty = DirtyCondition::DirtyLost;
+    }
+    region.evidence = EvidenceId::nil();
+    region.evidence_generation = EvidenceGeneration::nil();
+    region.note = "owning participant was fenced: " + reason;
+    region.updated_sequence = state.sequence;
+    JournalEntry entry;
+    entry.kind = JournalEntryKind::UpsertRegion;
+    entry.region = region;
+    entries.push_back(std::move(entry));
+  }
+
+  // 3. In-flight synchronizations to this participant have an indeterminate
+  //    outcome and are recorded as such rather than assumed to have failed.
+  for (auto& [sync_id, sync] : state.syncs) {
+    (void)sync_id;
+    if (sync.destination_participant != id || sync.destination_boot != boot) continue;
+    if (sync.state == SyncState::Completed || sync.state == SyncState::Cancelled ||
+        sync.state == SyncState::Failed) {
+      continue;
+    }
+    sync.state = SyncState::OutcomeUnknown;
+    sync.settled_sequence = state.sequence;
+    sync.failure_reason = "destination participant was fenced before synchronization completed";
+    JournalEntry entry;
+    entry.kind = JournalEntryKind::UpsertSync;
+    entry.sync = sync;
+    entries.push_back(std::move(entry));
+  }
+
+  // 4. Outstanding invalidations that targeted this incarnation's replicas are
+  //    satisfied vacuously and are never applied to a later generation.
+  for (auto& [invalidation_id, invalidation] : state.invalidations) {
+    (void)invalidation_id;
+    if (invalidation.target_participant != id || invalidation.target_boot != boot) continue;
+    if (invalidation.state != InvalidationState::Requested) continue;
+    invalidation.state = InvalidationState::Superseded;
+    invalidation.settled_sequence = state.sequence;
+    invalidation.rationale = "target replica generation disappeared with the fenced participant";
+    JournalEntry entry;
+    entry.kind = JournalEntryKind::UpsertInvalidation;
+    entry.invalidation = invalidation;
+    entries.push_back(std::move(entry));
+  }
+
+  // 5. Release the participant's read grants.
+  state.release_reads_for_participant_locked(id, boot);
+
+  for (auto& [object_id, object] : state.objects) {
+    (void)object_id;
+    state.recompute_authority_locked(object);
+  }
+}
+
+} // namespace
+
 Result<ParticipantRecord> CoherenceEngine::register_participant(std::string name,
                                                                 ParticipantBootId boot,
                                                                 CoordinatorEpoch epoch,
@@ -426,6 +555,7 @@ Result<ParticipantRecord> CoherenceEngine::register_participant(std::string name
   }
 
   ParticipantRecord record;
+  std::vector<JournalEntry> entries;
   if (existing != impl_->participant_index.end()) {
     record = impl_->participants.at(existing->second);
     if (record.boot == boot && record.lifecycle != ParticipantLifecycle::Retired) {
@@ -451,6 +581,13 @@ Result<ParticipantRecord> CoherenceEngine::register_participant(std::string name
     // so its replicas are retired rather than left addressable by a later
     // incarnation that no longer owns those bytes.
     const ParticipantBootId superseded_boot = record.boot;
+    // Fence the superseded incarnation first: its write authority, read grants,
+    // in-flight transfers and outstanding invalidations go with it. Retiring its
+    // replicas alone would leave an object write-locked by a process that no
+    // longer exists.
+    impl_->tick();
+    fence_incarnation_locked(*impl_, record.id, superseded_boot,
+                             "superseded by a new participant boot identity", entries);
     for (auto& [region_id, region] : impl_->regions) {
       (void)region_id;
       if (region.participant != record.id || region.boot != superseded_boot) continue;
@@ -467,7 +604,10 @@ Result<ParticipantRecord> CoherenceEngine::register_participant(std::string name
       region.updated_sequence = impl_->sequence;
       region.note = "retired when the owning participant was re-admitted under a new boot identity";
       impl_->release_region_name_locked(region);
-      impl_->upsert_durable_region_locked(region);
+      JournalEntry region_entry;
+      region_entry.kind = JournalEntryKind::UpsertRegion;
+      region_entry.region = region;
+      entries.push_back(std::move(region_entry));
     }
     record.previous_boot = record.boot;
     record.boot = boot;
@@ -493,7 +633,8 @@ Result<ParticipantRecord> CoherenceEngine::register_participant(std::string name
   entry.kind = JournalEntryKind::UpsertParticipant;
   entry.participant = record;
   scrub_participant_for_persistence(entry.participant);
-  Status written = impl_->append_locked(entry);
+  entries.push_back(std::move(entry));
+  Status written = impl_->append_many_locked(entries);
   if (!written.ok()) return Result<ParticipantRecord>::failure(written);
 
   impl_->participants[record.id] = record;
@@ -575,122 +716,7 @@ Result<ParticipantRecord> CoherenceEngine::fence_participant(ParticipantId id,
   impl_->tick();
   std::vector<JournalEntry> entries;
 
-  // 1. Revoke write authority held by this incarnation.
-  for (auto& [object_id, object] : impl_->objects) {
-    (void)object_id;
-    bool changed = false;
-    if (object.writer == id && object.writer_boot == boot) {
-      object.authority = AuthorityMode::None;
-      object.writer = ParticipantId::nil();
-      object.writer_boot = ParticipantBootId::nil();
-      if (object.publication_state == PublicationState::PendingDurable ||
-          object.publication_state == PublicationState::RecoveryRequired) {
-        object.publication_state = PublicationState::Aborted;
-        object.pending_publication = PublicationId::nil();
-        object.pending_version = VersionId::nil();
-        object.pending_content = ContentFingerprint{};
-        JournalEntry clear;
-        clear.kind = JournalEntryKind::ClearPendingPublication;
-        clear.remove_object = object.id;
-        entries.push_back(clear);
-      }
-      // The only dirty authority holder disappeared before publication. The
-      // runtime never invents a successful publication from this.
-      if (object.has_unpublished_dirty) {
-        object.has_unpublished_dirty = false;
-        switch (impl_->policies.count(object.policy) != 0
-                    ? impl_->policies.at(object.policy).dirty_loss_policy
-                    : DirtyLossPolicy::ReportUnknown) {
-          case DirtyLossPolicy::ReportLost:
-            object.dirty_condition = DirtyCondition::DirtyLost;
-            break;
-          case DirtyLossPolicy::RequireRecovery:
-            object.dirty_condition = DirtyCondition::DirtyUnknown;
-            object.lifecycle = ObjectLifecycle::RecoveryRequired;
-            object.recovery_note =
-                "dirty authority holder was fenced before publication; recoverable state is "
-                "unknown";
-            break;
-          case DirtyLossPolicy::ReportUnknown:
-          case DirtyLossPolicy::Unspecified:
-          default:
-            object.dirty_condition = DirtyCondition::DirtyUnknown;
-            break;
-        }
-      }
-      object.updated_sequence = impl_->sequence;
-      changed = true;
-    }
-    if (changed) {
-      ObjectRecord durable_copy = object;
-      scrub_object_for_persistence(durable_copy);
-      JournalEntry entry;
-      entry.kind = JournalEntryKind::UpsertObject;
-      entry.object = std::move(durable_copy);
-      entries.push_back(std::move(entry));
-    }
-  }
-
-  // 2. Fence the participant's regions. Fenced contents are never a source of
-  //    truth again for that incarnation.
-  for (auto& [region_id, region] : impl_->regions) {
-    (void)region_id;
-    if (region.participant != id || region.boot != boot) continue;
-    if (region.state == CoherenceState::Retired) continue;
-    region.state = CoherenceState::Fenced;
-    if (region.dirty == DirtyCondition::DirtyUnpublished) {
-      region.dirty = DirtyCondition::DirtyLost;
-    }
-    region.evidence = EvidenceId::nil();
-    region.evidence_generation = EvidenceGeneration::nil();
-    region.note = "owning participant was fenced: " + reason;
-    region.updated_sequence = impl_->sequence;
-    JournalEntry entry;
-    entry.kind = JournalEntryKind::UpsertRegion;
-    entry.region = region;
-    entries.push_back(std::move(entry));
-  }
-
-  // 3. In-flight synchronizations to this participant have an indeterminate
-  //    outcome and are recorded as such rather than assumed to have failed.
-  for (auto& [sync_id, sync] : impl_->syncs) {
-    (void)sync_id;
-    if (sync.destination_participant != id || sync.destination_boot != boot) continue;
-    if (sync.state == SyncState::Completed || sync.state == SyncState::Cancelled ||
-        sync.state == SyncState::Failed) {
-      continue;
-    }
-    sync.state = SyncState::OutcomeUnknown;
-    sync.settled_sequence = impl_->sequence;
-    sync.failure_reason = "destination participant was fenced before synchronization completed";
-    JournalEntry entry;
-    entry.kind = JournalEntryKind::UpsertSync;
-    entry.sync = sync;
-    entries.push_back(std::move(entry));
-  }
-
-  // 4. Outstanding invalidations that targeted this incarnation's replicas are
-  //    satisfied vacuously and are never applied to a later generation.
-  for (auto& [invalidation_id, invalidation] : impl_->invalidations) {
-    (void)invalidation_id;
-    if (invalidation.target_participant != id || invalidation.target_boot != boot) continue;
-    if (invalidation.state != InvalidationState::Requested) continue;
-    invalidation.state = InvalidationState::Superseded;
-    invalidation.settled_sequence = impl_->sequence;
-    invalidation.rationale = "target replica generation disappeared with the fenced participant";
-    JournalEntry entry;
-    entry.kind = JournalEntryKind::UpsertInvalidation;
-    entry.invalidation = invalidation;
-    entries.push_back(std::move(entry));
-  }
-
-  // 5. Release the participant's read grants.
-  impl_->release_reads_for_participant_locked(id, boot);
-
-  for (auto& [object_id, object] : impl_->objects) {
-    (void)object_id;
-    impl_->recompute_authority_locked(object);
-  }
+  fence_incarnation_locked(*impl_, id, boot, reason, entries);
 
   participant.lifecycle = ParticipantLifecycle::Fenced;
   participant.live = false;
