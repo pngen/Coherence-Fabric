@@ -68,7 +68,9 @@ class COHERENCE_API Listener {
   [[nodiscard]] Result<Socket> accept();
   [[nodiscard]] bool valid() const noexcept;
   [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
-  /// Make a blocking accept() return a failure.
+  /// Make a blocking accept() return. It returns either a failure or a
+  /// connection made by this call, which the caller, having been told to stop,
+  /// discards.
   Status interrupt();
   Status close();
 

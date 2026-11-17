@@ -1,11 +1,14 @@
 // Coherence Fabric -- Apache License 2.0 -- Copyright 2026 Summon Software Labs.
 //
 // Framing and protocol validation coverage, including malformed input.
+#include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "coherence/client.hpp"
+#include "coherence/coordinator.hpp"
 #include "coherence/protocol.hpp"
 #include "coherence/transport.hpp"
 #include "coherence/version.hpp"
@@ -232,6 +235,82 @@ CF_TEST(a_short_connection_is_reported_as_closed_not_as_a_protocol_fault) {
   (void)socket.value().close();
   (void)listener.value().interrupt();
   server.join();
+}
+
+// Regression: stop() joins every connection thread, so it has to end a read
+// that is blocked on a peer that stays connected and silent. One peer here
+// completed the handshake and is idle; the other connected and never sent a
+// byte, so it is not a session yet.
+CF_TEST(coordinator_stop_returns_while_peers_stay_connected) {
+  context.phase("START");
+  coherence::Coordinator coordinator{coherence::CoordinatorOptions{}};
+  CF_REQUIRE(coordinator.start().ok());
+  std::thread acceptor([&] { (void)coordinator.run(); });
+
+  coherence::ClientOptions idle_options;
+  idle_options.port = coordinator.port();
+  idle_options.participant_name = "idle";
+  idle_options.boot = coherence::generate_participant_boot_id();
+  coherence::ControlClient idle;
+  const bool idle_connected = idle.connect_and_handshake(idle_options).ok();
+  auto silent = coherence::Socket::connect("127.0.0.1", coordinator.port());
+  // Barrier: both connections are being served.
+  while (silent.has_value() &&
+         coordinator.render_status().find(" accepted=2 ") == std::string::npos) {
+    std::this_thread::yield();
+  }
+
+  context.phase("STOP");
+  std::promise<void> stopped;
+  std::future<void> done = stopped.get_future();
+  std::thread stopper([&] {
+    (void)coordinator.stop();
+    stopped.set_value();
+  });
+  const bool returned = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  // Closing the peers releases a stop() that is still waiting on them.
+  if (silent.has_value()) (void)silent.value().close();
+  (void)idle.close();
+  stopper.join();
+  acceptor.join();
+  CF_EXPECT(idle_connected);
+  CF_EXPECT(silent.has_value());
+  CF_EXPECT(returned);
+}
+
+// Regression: a shutdown request has to end the accept loop by itself, not
+// when the next connection happens to arrive.
+CF_TEST(a_shutdown_request_ends_the_accept_loop) {
+  context.phase("START");
+  coherence::Coordinator coordinator{coherence::CoordinatorOptions{}};
+  CF_REQUIRE(coordinator.start().ok());
+  std::promise<void> finished;
+  std::future<void> done = finished.get_future();
+  std::thread acceptor([&] {
+    (void)coordinator.run();
+    finished.set_value();
+  });
+
+  context.phase("SHUTDOWN");
+  coherence::ClientOptions admin_options;
+  admin_options.port = coordinator.port();
+  admin_options.participant_name = "admin";
+  admin_options.boot = coherence::generate_participant_boot_id();
+  coherence::ControlClient admin;
+  const bool connected = admin.connect_and_handshake(admin_options).ok();
+  bool accepted = false;
+  if (connected) {
+    const auto reply = admin.request(coherence::MessageType::Shutdown, coherence::ByteSpan{});
+    accepted = reply.has_value() && reply.value().envelope.code == coherence::StatusCode::Ok;
+  }
+  (void)admin.close();
+  const bool returned = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  // stop() releases an accept loop that is still waiting.
+  (void)coordinator.stop();
+  acceptor.join();
+  CF_EXPECT(connected);
+  CF_EXPECT(accepted);
+  CF_EXPECT(returned);
 }
 
 CF_TEST_MAIN()

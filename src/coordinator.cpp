@@ -36,6 +36,9 @@ struct Coordinator::Impl {
   mutable std::mutex mutex;
   std::map<SessionId, std::shared_ptr<Session>> sessions;
   std::map<ParticipantId, SessionId> participant_session;
+  // Every socket a connection thread is serving, whether or not it has become
+  // a session. A socket leaves this list, under the mutex, before it is closed.
+  std::vector<std::shared_ptr<Socket>> live_sockets;
   std::vector<std::thread> threads;
   std::atomic<bool> stopping{false};
   std::atomic<std::uint64_t> accepted{0};
@@ -142,6 +145,9 @@ Status Coordinator::run() {
     Socket socket = std::move(accepted.value());
     {
       std::lock_guard<std::mutex> guard(impl_->mutex);
+      // stop() collects the connection threads under this mutex after it has
+      // set the flag, so a thread started here is always one it joins.
+      if (impl_->stopping.load(std::memory_order_acquire)) break;
       impl_->threads.emplace_back([this, sock = std::move(socket)]() mutable {
         (void)serve_socket(std::move(sock));
       });
@@ -164,16 +170,15 @@ Status Coordinator::stop() {
   }
   impl_->stopping.store(true, std::memory_order_release);
   (void)listener_.interrupt();
-  {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    for (auto& [id, session] : impl_->sessions) {
-      (void)id;
-      if (session->socket) (void)session->socket->shutdown();
-    }
-  }
   std::vector<std::thread> threads;
   {
     std::lock_guard<std::mutex> guard(impl_->mutex);
+    // Every socket being served is shut down, not only those that became
+    // sessions: a connection thread may be blocked reading from a peer that
+    // stays connected and silent, and the join below would wait on that peer.
+    for (const std::shared_ptr<Socket>& live : impl_->live_sockets) {
+      (void)live->shutdown();
+    }
     threads.swap(impl_->threads);
   }
   for (std::thread& thread : threads) {
@@ -234,7 +239,26 @@ Status Coordinator::serve_socket(Socket socket) {
   auto session = std::make_shared<Session>();
   session->socket = std::make_shared<Socket>(std::move(socket));
   session->peer = session->socket->peer();
+  {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    if (impl_->stopping.load(std::memory_order_acquire)) {
+      return Status(StatusCode::ShuttingDown, "the coordinator is stopping");
+    }
+    impl_->live_sockets.push_back(session->socket);
+  }
   impl_->accepted.fetch_add(1, std::memory_order_relaxed);
+
+  // The socket leaves the live list before it is closed, under the mutex
+  // stop() holds while it shuts the live sockets down, so stop() never touches
+  // a socket that is being closed. Never called with the mutex held.
+  auto close_socket = [&]() {
+    {
+      std::lock_guard<std::mutex> guard(impl_->mutex);
+      auto& live = impl_->live_sockets;
+      live.erase(std::remove(live.begin(), live.end(), session->socket), live.end());
+    }
+    (void)session->socket->close();
+  };
 
   auto refuse = [&](StatusCode code, const std::string& message,
                     const std::string& detail = std::string()) -> Status {
@@ -245,7 +269,7 @@ Status Coordinator::serve_socket(Socket socket) {
     header.type = MessageType::Response;
     (void)write_frame(*session->socket, header, body.span());
     (void)session->socket->shutdown();
-    (void)session->socket->close();
+    close_socket();
     impl_->rejected.fetch_add(1, std::memory_order_relaxed);
     return Status(code, message, detail);
   };
@@ -254,7 +278,7 @@ Status Coordinator::serve_socket(Socket socket) {
   Frame hello_frame;
   Status read = read_frame(*session->socket, options_.frames, hello_frame);
   if (!read.ok()) {
-    (void)session->socket->close();
+    close_socket();
     return read;
   }
   if (hello_frame.header.type != MessageType::Hello) {
@@ -295,31 +319,36 @@ Status Coordinator::serve_socket(Socket socket) {
     }
     // Connection replacement: an existing live session for this participant is
     // closed first so that two incarnations never hold authority at once.
+    bool at_capacity = false;
     {
       std::lock_guard<std::mutex> guard(impl_->mutex);
-      if (impl_->sessions.size() >= max_sessions) {
-        return refuse(StatusCode::CapacityExceeded, "session capacity reached");
-      }
-      auto existing = engine_->find_participant(hello.participant_name);
-      if (existing.has_value()) {
-        const auto it = impl_->participant_session.find(existing.value().id);
-        if (it != impl_->participant_session.end()) {
-          const auto old = impl_->sessions.find(it->second);
-          if (old != impl_->sessions.end()) {
-            old->second->replaced = true;
-            if (old->second->socket) (void)old->second->socket->shutdown();
-            impl_->sessions.erase(old);
-            impl_->participant_session.erase(it);
+      at_capacity = impl_->sessions.size() >= max_sessions;
+      if (!at_capacity) {
+        auto existing = engine_->find_participant(hello.participant_name);
+        if (existing.has_value()) {
+          const auto it = impl_->participant_session.find(existing.value().id);
+          if (it != impl_->participant_session.end()) {
+            const auto old = impl_->sessions.find(it->second);
+            if (old != impl_->sessions.end()) {
+              old->second->replaced = true;
+              if (old->second->socket) (void)old->second->socket->shutdown();
+              impl_->sessions.erase(old);
+              impl_->participant_session.erase(it);
+            }
+          }
+          if (existing.value().boot != hello.boot) {
+            // A new boot identity supersedes the previous incarnation. Anything
+            // the previous incarnation still held is revoked before admission.
+            (void)engine_->fence_participant(
+                existing.value().id, engine_->epoch(),
+                "superseded by a new participant boot identity");
           }
         }
-        if (existing.value().boot != hello.boot) {
-          // A new boot identity supersedes the previous incarnation. Anything
-          // the previous incarnation still held is revoked before admission.
-          (void)engine_->fence_participant(
-              existing.value().id, engine_->epoch(),
-              "superseded by a new participant boot identity");
-        }
       }
+    }
+    // Refused outside the mutex: the refusal writes to the socket and closes it.
+    if (at_capacity) {
+      return refuse(StatusCode::CapacityExceeded, "session capacity reached");
     }
     auto registered = engine_->register_participant(hello.participant_name, hello.boot,
                                                     engine_->epoch(), hello.node_label);
@@ -361,10 +390,12 @@ Status Coordinator::serve_socket(Socket socket) {
     header.correlation = hello_frame.header.correlation;
     Status sent = write_frame(*session->socket, header, body.span());
     if (!sent.ok()) {
-      std::lock_guard<std::mutex> guard(impl_->mutex);
-      impl_->sessions.erase(session->id);
-      impl_->participant_session.erase(participant.id);
-      (void)session->socket->close();
+      {
+        std::lock_guard<std::mutex> guard(impl_->mutex);
+        impl_->sessions.erase(session->id);
+        impl_->participant_session.erase(participant.id);
+      }
+      close_socket();
       return sent;
     }
   }
@@ -449,7 +480,7 @@ Status Coordinator::serve_socket(Socket socket) {
     }
   }
   (void)session->socket->shutdown();
-  (void)session->socket->close();
+  close_socket();
 
   if (observer || session->replaced) return Status::success();
   if (!session->participant.defined()) return Status::success();

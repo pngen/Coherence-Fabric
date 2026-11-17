@@ -196,6 +196,9 @@ Status Socket::shutdown() {
   if (!valid()) return Status::success();
 #if defined(_WIN32)
   (void)::shutdown(static_cast<native_socket_t>(handle_), SD_BOTH);
+  // shutdown() only fails the calls that follow it. A read that another thread
+  // has already blocked is ended by cancelling it.
+  (void)::CancelIoEx(reinterpret_cast<HANDLE>(handle_), nullptr);
 #else
   (void)::shutdown(static_cast<native_socket_t>(handle_), SHUT_RDWR);
 #endif
@@ -326,10 +329,39 @@ Result<Socket> Listener::accept() {
 
 Status Listener::interrupt() {
   if (!valid()) return Status::success();
+  const native_socket_t listener = static_cast<native_socket_t>(handle_);
 #if defined(_WIN32)
-  (void)::shutdown(static_cast<native_socket_t>(handle_), SD_BOTH);
+  (void)::shutdown(listener, SD_BOTH);
 #else
-  (void)::shutdown(static_cast<native_socket_t>(handle_), SHUT_RDWR);
+  (void)::shutdown(listener, SHUT_RDWR);
+#endif
+  // shutdown() does not end an accept() that is already blocked on every
+  // platform, and on Windows it never does. A connection to the listener does:
+  // accept() returns it, and the accept loop, which has been told to stop by
+  // then, discards it.
+  ::sockaddr_storage address{};
+#if defined(_WIN32)
+  int length = static_cast<int>(sizeof(address));
+#else
+  socklen_t length = static_cast<socklen_t>(sizeof(address));
+#endif
+  if (::getsockname(listener, reinterpret_cast<::sockaddr*>(&address), &length) != 0) {
+    return Status::success();
+  }
+  if (address.ss_family == AF_INET) {
+    auto* ipv4 = reinterpret_cast<::sockaddr_in*>(&address);
+    if (ipv4->sin_addr.s_addr == htonl(INADDR_ANY)) ipv4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  } else if (address.ss_family == AF_INET6) {
+    auto* ipv6 = reinterpret_cast<::sockaddr_in6*>(&address);
+    if (IN6_IS_ADDR_UNSPECIFIED(&ipv6->sin6_addr)) ipv6->sin6_addr = in6addr_loopback;
+  }
+  const native_socket_t wake = ::socket(address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+  if (!socket_valid(wake)) return Status::success();
+  (void)::connect(wake, reinterpret_cast<const ::sockaddr*>(&address), length);
+#if defined(_WIN32)
+  ::closesocket(wake);
+#else
+  ::close(wake);
 #endif
   return Status::success();
 }
