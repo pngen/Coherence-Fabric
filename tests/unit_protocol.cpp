@@ -313,5 +313,36 @@ CF_TEST(a_shutdown_request_ends_the_accept_loop) {
   CF_EXPECT(returned);
 }
 
+// Regression: the session bound applies to observer sessions as well. They
+// are sessions, and an unbounded number of them would also keep participants
+// out, because the bound a participant is checked against counts them.
+CF_TEST(observer_sessions_count_against_the_session_bound) {
+  context.phase("START");
+  coherence::CoordinatorOptions options;
+  options.max_sessions = 1;
+  coherence::Coordinator coordinator{options};
+  CF_REQUIRE(coordinator.start().ok());
+  std::thread acceptor([&] { (void)coordinator.run(); });
+
+  context.phase("CONNECT");
+  coherence::ClientOptions observer_options;
+  observer_options.port = coordinator.port();
+  observer_options.observer = true;
+  coherence::ControlClient first;
+  const coherence::Status first_status = first.connect_and_handshake(observer_options);
+  coherence::ControlClient second;
+  const coherence::Status second_status = second.connect_and_handshake(observer_options);
+  const std::uint64_t sessions = coordinator.active_sessions();
+
+  (void)first.close();
+  (void)second.close();
+  (void)coordinator.stop();
+  acceptor.join();
+  CF_EXPECT(first_status.ok());
+  CF_EXPECT(!second_status.ok());
+  CF_EXPECT(second_status.code() == coherence::StatusCode::CapacityExceeded);
+  CF_EXPECT_EQ_U(sessions, 1u);
+}
+
 CF_TEST_MAIN()
 

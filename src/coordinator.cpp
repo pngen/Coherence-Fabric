@@ -309,6 +309,17 @@ Status Coordinator::serve_socket(Socket socket) {
   const std::uint64_t max_sessions = options_.max_sessions == 0 ? 1 : options_.max_sessions;
   ParticipantRecord participant;
   bool observer = hello.observer;
+  if (observer) {
+    // An observer session is a session: it counts against the bound too.
+    bool at_capacity = false;
+    {
+      std::lock_guard<std::mutex> guard(impl_->mutex);
+      at_capacity = impl_->sessions.size() >= max_sessions;
+    }
+    if (at_capacity) {
+      return refuse(StatusCode::CapacityExceeded, "session capacity reached");
+    }
+  }
   if (!observer) {
     if (hello.participant_name.empty()) {
       return refuse(StatusCode::InvalidArgument, "a participant name is required");
